@@ -51,3 +51,14 @@ ssh -N -J <jump_host_user>@<jump_host_domain> <remote_user>@<remote_node> -L 300
 ```bash
 ssh -N -R 30000:localhost:30000 <local_user>@<local_machine_domain>
 ```
+
+## Training and Inference Metrics
+
+**Gradient Norm**
+![Gradient Norm](assets/wandbimages/grad_norm.png)
+
+**Training Loss**
+![Training Loss](assets/wandbimages/loss.png)
+
+**Weight Update Latency**
+![Update Latency](assets/wandbimages/latency.png)
