@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 import httpx
+import json
 from httpx import Response
 from openai import AsyncOpenAI, NotFoundError
 
@@ -60,15 +61,65 @@ async def check_has_model(client: AsyncOpenAI, model_name: str) -> None:
     logger.debug(f"Model {model_name} was found in the inference pool")
 
 
+# async def update_weights(client: AsyncOpenAI, path: Path, step: int) -> None:
+#     """Make a HTTP post request to the vLLM server to update the weights."""
+#     logger = get_logger()
+#     url = str(client.base_url).strip()[:-4] + "/update_weights"
+#     try:
+#         model_path = get_weight_ckpt_model_path(path, step).absolute()
+#         logger.debug(f"Sending request to {url} to update weights from {model_path}")
+#         # print(f"Sending request to {url} to update weights from {model_path}")
+#         # Sending request to http://127.0.0.1:30000/update_weights to update weights from /scratch/luogeng/project/prime-rl/outputs/weights/step_1/pytorch_model.bin
+#         await client.post(url, cast_to=Response, body={"model_path": model_path.as_posix()})
+#     except NotFoundError:
+#         logger.warning(f"The route {url} does not exist. Skipping weight update.")
+#         return
+
 async def update_weights(client: AsyncOpenAI, path: Path, step: int) -> None:
-    """Make a HTTP post request to the vLLM server to update the weights."""
+    """
+    Upload a single .pt weights file to the vLLM server via multipart/form-data.
+    Matches the new inference /update_weights endpoint (MVP).
+    """
     logger = get_logger()
     url = str(client.base_url).strip()[:-4] + "/update_weights"
+
+    # 取得本地权重文件路径（例：.../outputs/weights/step_{step}/pytorch_model.bin）
+    model_path = get_weight_ckpt_model_path(path, step).absolute()
+    logger.debug(f"Uploading weights for step {step} from {model_path} to {url}")
+    print(f"Uploading weights for step {step} from {model_path} to {url}")
+
+    # 说明：
+    # - 我们用独立的 httpx.AsyncClient 发 multipart（OpenAI 客户端默认是 JSON）
+    # - 连接超时保持 5s，读超时给足（1 小时）以覆盖 1GB 级上传
+    timeout = httpx.Timeout(connect=5.0, read=3600.0, write=3600.0, pool=3600.0)
+
+    limits = httpx.Limits(max_connections=10, max_keepalive_connections=10)
+
     try:
-        model_path = get_weight_ckpt_model_path(path, step).absolute()
-        logger.debug(f"Sending request to {url} to update weights from {model_path}")
-        await client.post(url, cast_to=Response, body={"model_path": model_path.as_posix()})
+        # 以流式方式上传文件：不要把 1GB 读进内存
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as ac:
+            # metadata 放 JSON 字符串；format 固定 "pt"（MVP）
+            metadata = {"step": step, "format": "pt"}
+
+            # 用文件句柄做流式上传；务必按二进制方式打开
+            with open(model_path, "rb") as fh:
+                data = {"metadata": json.dumps({"step": step, "format": "pt"})}
+                files = {"file": (model_path.name, fh, "application/octet-stream")}
+                resp = await ac.post(url, data=data, files=files)
+
+            # 统一错误处理
+            if resp.status_code >= 400:
+                try:
+                    detail = resp.json()
+                except Exception:
+                    detail = resp.text
+                raise RuntimeError(f"update_weights failed ({resp.status_code}): {detail}")
+
+            # 日志记录成功
+            logger.debug(f"update_weights OK: {resp.text}")
+
     except NotFoundError:
+        # 兼容 inference 未实现该路由的情况（比如老版本）
         logger.warning(f"The route {url} does not exist. Skipping weight update.")
         return
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Union
 
 import torch
 
@@ -11,9 +12,32 @@ class CheckpointWorker:
     recent policy model from a checkpoint directory.
     """
 
-    def update_weights(self, model_path: Path) -> None:
-        """Update weights from a specified path pointing to a .pt file."""
-        state_dict = torch.load(model_path, map_location="cpu", mmap=True)
+    # def update_weights(self, model_path: Path) -> None:
+    #     """Update weights from a specified path pointing to a .pt file."""
+    #     state_dict = torch.load(model_path, map_location="cpu", mmap=True)
+
+    #     def weights_iterator():
+    #         for key, value in state_dict.items():
+    #             if not key:
+    #                 continue
+    #             yield key, value
+
+    #     self.model_runner.model.load_weights(weights_iterator())
+
+    #     # Process weights after loading (important for some models)
+    #     from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+    #     device = next(self.model_runner.model.parameters()).device
+    #     process_weights_after_loading(self.model_runner.model, self.model_runner.model_config, device)
+
+    def update_weights(self, model_path: Union[str, Path]) -> None:
+        """Update weights from a specified path pointing to a single .pt file."""
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"weights file not found: {model_path}")
+
+        # MVP：只支持 pt；后续可加 safetensors 分支
+        state_dict = torch.load(str(model_path), map_location="cpu", mmap=True)
 
         def weights_iterator():
             for key, value in state_dict.items():

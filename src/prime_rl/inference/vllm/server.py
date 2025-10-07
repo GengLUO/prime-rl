@@ -6,6 +6,8 @@ from typing import Any, Optional
 import uvloop
 import vllm.envs as envs
 from fastapi import Request
+from fastapi import UploadFile, File, Form, HTTPException
+import os, shutil, json, tempfile, asyncio
 from vllm.config import LogprobsMode
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
@@ -26,6 +28,10 @@ from vllm.utils import FlexibleArgumentParser
 from prime_rl.inference.config import InferenceConfig
 
 logger = init_logger("vllm.entrypoints.openai.api_server")
+_UPDATE_LOCK = asyncio.Lock()
+# _STAGING_DIR = os.environ.get("PRIMERL_STAGING_DIR", "/tmp/prime-rl/staging")
+_STAGING_DIR = os.environ.get("PRIMERL_STAGING_DIR", "/scratch/users/nus/e1604484/project/prime-rl/staging")
+os.makedirs(_STAGING_DIR, exist_ok=True)
 
 
 # Copied from vllm/entrypoints/openai/api_server.py
@@ -64,12 +70,91 @@ async def custom_run_server_worker(listen_address, sock, args, client_config=Non
         app = build_app(args)
 
         ### CUSTOM ENDPOINTS ###
+        # @app.post("/update_weights")
+        # async def _update_weights(request: Request):
+        #     data = await request.json()
+        #     model_path = data.get("model_path")
+        #     await engine_client.collective_rpc("update_weights", args=(model_path,))
+        #     return {"status": "ok"}
+
         @app.post("/update_weights")
-        async def _update_weights(request: Request):
-            data = await request.json()
-            model_path = data.get("model_path")
-            await engine_client.collective_rpc("update_weights", args=(model_path,))
-            return {"status": "ok"}
+        async def _update_weights(
+            request: Request,
+            # multipart 路径（MVP：单文件 .pt）
+            metadata: str | None = Form(default=None),
+            file: UploadFile | None = File(default=None),
+        ):
+            """
+            两种用法：
+            1) 兼容旧 JSON：{"model_path": "/abs/path/to/pytorch_model.bin"}
+            2) 新增 multipart：
+            - metadata: JSON 字符串，如 {"step": 12, "format": "pt"}
+            - file:     上传的二进制文件（单文件 .pt）
+            """
+            async with _UPDATE_LOCK:
+                # 分支 1：multipart 上传
+                if file is not None:
+                    try:
+                        meta = json.loads(metadata) if metadata else {}
+                    except Exception:
+                        raise HTTPException(status_code=400, detail="invalid metadata json")
+
+                    step = int(meta.get("step", -1))
+                    fmt = (meta.get("format") or "pt").lower()
+                    if fmt != "pt":
+                        # MVP 只支持 pt；后续再扩 safetensors
+                        raise HTTPException(status_code=415, detail="MVP only supports format=pt")
+
+                    # 以 step 命名临时文件；若无 step 就用 NamedTemporaryFile
+                    if step >= 0:
+                        tmp_path = os.path.join(_STAGING_DIR, f"step_{step}.bin")
+                        f = open(tmp_path, "wb")
+                        should_close = True
+                    else:
+                        tf = tempfile.NamedTemporaryFile(prefix="weights_", suffix=".bin", dir=_STAGING_DIR, delete=False)
+                        tmp_path = tf.name
+                        f = tf
+                        should_close = False
+
+                    # 流式落盘，避免把 1GB 全读进内存
+                    try:
+                        with f:
+                            shutil.copyfileobj(file.file, f, length=8 << 20)  # 8 MiB block
+                    except Exception as e:
+                        # 落盘失败清理
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                        raise HTTPException(status_code=500, detail=f"write temp file failed: {e}")
+
+                    # 调用引擎加载
+                    try:
+                        await engine_client.collective_rpc("update_weights", args=(tmp_path,))
+                        return {"status": "ok", "serving_step": step if step >= 0 else None, "message": "activated from upload"}
+                    except Exception as e:
+                        # 加载失败，保持旧模型继续服务
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                        raise HTTPException(status_code=500, detail=f"update_weights failed: {e}")
+
+                # 分支 2：兼容原 JSON（传本地路径）
+                try:
+                    data = await request.json()
+                except Exception:
+                    raise HTTPException(status_code=400, detail="no multipart file and invalid/empty JSON body")
+
+                model_path = data.get("model_path")
+                if not model_path:
+                    raise HTTPException(status_code=400, detail="model_path is required when not uploading file")
+
+                try:
+                    await engine_client.collective_rpc("update_weights", args=(model_path,))
+                    return {"status": "ok", "message": "activated from path"}
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"update_weights failed: {e}")
 
         @app.post("/reload_weights")
         async def _reload_weights(request: Request):
